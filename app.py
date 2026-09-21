@@ -28,17 +28,35 @@ MAX_CONCURRENT = 2                      # 同时处理的任务数
 JOB_TTL = 2 * 3600                      # 任务产物保留 2 小时
 _SEM = threading.Semaphore(MAX_CONCURRENT)
 
-# 内置免密钥通道（WorkBuddy 云服务，已为本应用开通）
-# 说明：publishable key 可以由环境变量覆盖——把仓库公开到 GitHub 时，
-# 建议清空下面的默认值并改用 WB_PUBLISHABLE_KEY / WB_ENDPOINT 环境变量，
-# 否则别人可以用你的额度调用。
+# ── 内置免密钥通道（WorkBuddy 云服务，已为本应用开通）──
+# 密钥**绝不写进代码**：只从环境变量 WB_PUBLISHABLE_KEY 读取，
+# 或放在同目录的 .env 文件里（.env 已列入 .gitignore，不会进仓库）。
+# 部署时通过启动命令注入：WB_PUBLISHABLE_KEY=xxx python app.py
+def _load_dotenv():
+    p = os.path.join(APP_DIR, '.env')
+    if not os.path.exists(p):
+        return
+    try:
+        for line in open(p, encoding='utf-8'):
+            line = line.strip()
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            k, v = line.split('=', 1)
+            k, v = k.strip(), v.strip().strip('"').strip("'")
+            if k and k not in os.environ:          # 真实环境变量优先
+                os.environ[k] = v
+    except Exception:
+        pass
+
+
+_load_dotenv()
+
 BUILTIN = {
     'endpoint': os.environ.get('WB_ENDPOINT',
                                'https://pdf-translator.app.workbuddy.host'),
-    'publishable_key': os.environ.get(
-        'WB_PUBLISHABLE_KEY',
-        '__SET_VIA_ENV__'),
+    'publishable_key': os.environ.get('WB_PUBLISHABLE_KEY', ''),
 }
+BUILTIN_ENABLED = bool(BUILTIN['publishable_key'])
 
 DEFAULT_CFG = {
     'engine': 'builtin',        # builtin | custom | none
@@ -86,6 +104,10 @@ def save_cfg(c):
 def make_translator(cfg, log):
     engine = cfg.get('engine', 'builtin')
     if engine == 'builtin':
+        if not BUILTIN_ENABLED:
+            raise RuntimeError(
+                '内置免密钥通道未配置：请设置环境变量 WB_PUBLISHABLE_KEY'
+                '（或在同目录建 .env 写入该变量），或改用「自定义接口」填自己的 API Key。')
         log('使用内置免密钥通道（WorkBuddy 云服务），模型：%s' % cfg.get('model'))
         return T.CloudTranslator(endpoint=BUILTIN['endpoint'],
                                  publishable_key=BUILTIN['publishable_key'],
@@ -224,6 +246,8 @@ def post_cfg(c: dict):
 @app.get('/api/models')
 def get_models():
     """内置免密钥通道的可用模型列表。"""
+    if not BUILTIN_ENABLED:
+        return {'models': [], 'error': '内置通道未配置密钥（WB_PUBLISHABLE_KEY）'}
     try:
         tr = T.CloudTranslator(endpoint=BUILTIN['endpoint'],
                                publishable_key=BUILTIN['publishable_key'])
@@ -319,6 +343,10 @@ def _start_bench(force=False):
 
     def work():
         try:
+            if not BUILTIN_ENABLED:
+                SPEED['error'] = ('内置通道未配置密钥（WB_PUBLISHABLE_KEY），'
+                                  '无法测速；可改用「自定义接口」填自己的 API Key。')
+                return
             tr = T.CloudTranslator(endpoint=BUILTIN['endpoint'],
                                    publishable_key=BUILTIN['publishable_key'])
             ms = [m['id'] for m in tr.models()

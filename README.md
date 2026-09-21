@@ -37,13 +37,21 @@
 ```bash
 pip install -r requirements.txt
 
-# 本地起服务，浏览器打开 http://127.0.0.1:8765
+# 1) 配置「内置免密钥通道」的 publishable key（二选一）
+export WB_PUBLISHABLE_KEY=wbpk_xxx     # 方式 A：环境变量
+cp .env.example .env && vim .env       # 方式 B：.env 文件（已被 .gitignore 忽略，不会进仓库）
+
+# 2) 本地起服务，浏览器打开 http://127.0.0.1:8765
 python app.py
 
 # 或者命令行直接翻译
 python app.py input.pdf --engine builtin --model deepseek-v4-flash \
     --formats docx,pdf,html -o out/译本
 ```
+
+> **本仓库不含任何密钥。** 不配置 `WB_PUBLISHABLE_KEY` 时「内置通道」不可用（启动日志会提示），
+> 可在页面上切到「自定义接口」填入自己的 OpenAI 兼容 API Key（DeepSeek / OpenAI / 智谱…均可），
+> 或按上面的方式配置环境变量。
 
 命令行参数：
 
@@ -59,9 +67,10 @@ python app.py input.pdf --engine builtin --model deepseek-v4-flash \
 
 ```bash
 export WB_ENDPOINT=https://your-app.example.com      # 可选
-export WB_PUBLISHABLE_KEY=wbpk_xxx                   # 建议用环境变量，别写进代码
+export WB_PUBLISHABLE_KEY=wbpk_xxx                   # 必填：绝不写进代码/仓库
 python app.py                                        # 监听 8000 端口（容器里）
 ```
+密钥只从环境变量（或同目录 `.env`）读取，代码里没有任何默认密钥；公开仓库因此不会泄露额度。
 
 > ⚠️ 如果要**公开**这个仓库，请先把 `app.py` 里 `BUILTIN['publishable_key']` 的默认值清空，
 > 改用环境变量注入——否则任何人都能用你的账号额度调用云通道。
