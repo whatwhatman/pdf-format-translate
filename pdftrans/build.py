@@ -12,7 +12,7 @@ warnings.filterwarnings('ignore')
 
 from docx import Document
 from docx.shared import Pt, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_TAB_ALIGNMENT, WD_BREAK
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement, parse_xml
@@ -178,6 +178,22 @@ def _shade(cell, fill):
     shd.set(qn('w:val'), 'clear'); shd.set(qn('w:color'), 'auto'); shd.set(qn('w:fill'), fill)
     tcPr.append(shd)
 
+def _xml_safe(t):
+    """剔除 XML 1.0 不允许的字符（如 PDF 文本层里偶发的 0x01 控制符）。
+
+    python-docx 用的是 lxml，遇到这类字符会直接抛
+    "All strings must be XML compatible" 让整份 docx 生成失败；
+    HTML 里它们也会变成乱码方块。注意不可删的合法字符：\\t \\n \\r。
+    """
+    if not t:
+        return t
+    return ''.join(ch for ch in t
+                   if ch in '\t\n\r'
+                   or 0x20 <= ord(ch) <= 0xD7FF
+                   or 0xE000 <= ord(ch) <= 0xFFFD
+                   or ord(ch) >= 0x10000)
+
+
 def _field(p, code):
     """插入可自动更新的 Word 域，如 PAGE / NUMPAGES。"""
     r = p.add_run()
@@ -218,7 +234,7 @@ def _emit(container, blk, space_after=3):
                 pass
             for kind, *r2 in suffix:
                 if kind == 'text' and r2 and r2[0]:
-                    sr = ip.add_run(r2[0])
+                    sr = ip.add_run(_xml_safe(r2[0]))
                     _set_run(sr, size=size, bold=blk.bold, italic=blk.italic,
                              color=blk.color)
             continue
@@ -248,7 +264,7 @@ def _emit(container, blk, space_after=3):
                     head_done = True
                 if not txt:
                     continue
-                r = p.add_run(txt)
+                r = p.add_run(_xml_safe(txt))
                 _set_run(r, size=size, bold=(bold or blk.bold), italic=(italic or blk.italic),
                          color=blk.color, cjk=_head_cjk if blk.role == 'heading' else None)
             else:
@@ -295,14 +311,14 @@ def render_docx(doc: Doc, path: str, progress=None):
         parts = [' '.join(seg[1] for seg in parse_template(b.template, b.refs) if seg[0] == 'text')
                  for b in doc.header[:2]]
         if parts:
-            hp.add_run(parts[0] + '\t' + (parts[1] if len(parts) > 1 else ''))
+            hp.add_run(_xml_safe(parts[0]) + '\t' + _xml_safe(parts[1] if len(parts) > 1 else ''))
     # 页脚：左＝原页脚文字（首段），右＝页码 n / N（原生域）
     fp = s.footer.paragraphs[0]; _clear(fp)
     fp = s.footer.add_paragraph()
     fp.paragraph_format.tab_stops.add_tab_stop(Cm(TW), WD_TAB_ALIGNMENT.RIGHT)
     left = ' '.join(''.join(seg[1] for seg in parse_template(b.template, b.refs)
                             if seg[0] == 'text') for b in doc.footer[:1])
-    r = fp.add_run(left + '\t'); _set_run(r, size=9)
+    r = fp.add_run(_xml_safe(left) + '\t'); _set_run(r, size=9)
     _field(fp, 'PAGE'); r = fp.add_run(' / '); _set_run(r, size=9); _field(fp, 'NUMPAGES')
 
     def box(container, blk, nested=False):
@@ -337,6 +353,12 @@ def render_docx(doc: Doc, path: str, progress=None):
         if progress:
             progress(0.9 + 0.1 * i / total, '排版中')
         if blk.t == 'pagebreak':
+            # 原 PDF 的页边界：Word 里插真正的分页符。
+            # （原先这里直接 continue，短页文档会被压缩合并成一页——实测 3 页压成 1 页）
+            bp = d.add_paragraph()
+            bp.paragraph_format.space_after = Pt(0)
+            bp.paragraph_format.line_spacing = 1.0
+            bp.add_run().add_break(WD_BREAK.PAGE)
             continue
         if blk.t == 'box':
             box(d, blk)
@@ -370,8 +392,11 @@ math,.mmath{font-family:"Cambria Math","STIX Two Math",serif}
 img.mmath{vertical-align:-2px}
 .box{margin:9px 0;padding:9px 12px 10px;border-radius:1px}
 .box .b-inner>.p-first{margin-top:0}
+/* 原 PDF 的页边界：屏幕上看不出（高度 0），打印/导出 PDF 时强制分页 */
+.pbreak{height:0;margin:0;padding:0;border:0;page-break-after:always;break-after:page}
 @media print{body{background:#fff;padding:0}
  .page{width:auto!important;min-height:0!important;margin:0!important;padding:0!important;box-shadow:none!important}
+ .pbreak{page-break-after:always;break-after:page}
  .box,table,tr{break-inside:avoid}
  h1,h2,h3,h4{break-after:avoid}
  @page{size:A4;margin:1.8cm 2.1cm 1.5cm}}
@@ -384,7 +409,7 @@ def _seg_html(kind, rest, strip_lead_flag):
         if strip_lead_flag:
             txt = strip_bullet(txt)[0]
         import html as H
-        t = H.escape(txt)
+        t = H.escape(_xml_safe(txt))
         if bold: t = '<b>%s</b>' % t
         if italic: t = '<i>%s</i>' % t
         return t
@@ -455,6 +480,9 @@ def _html_blocks(blocks, doc=None):
     while i < len(blocks):
         blk = blocks[i]
         if blk.t == 'pagebreak':
+            # 保留原 PDF 的页边界：显式分页（Chrome 打印 PDF 时生效）。
+            # 原先直接跳过 → HTML/PDF 全篇连排，短页文档会被压成一页。
+            out.append('<div class="pbreak"></div>')
             i += 1
             continue
         if blk.t == 'box':
@@ -473,7 +501,14 @@ def _html_blocks(blocks, doc=None):
         i += 1
     return ''.join(out)
 
-def render_html(doc: Doc, path: str, progress=None):
+def render_html(doc: Doc, path: str, progress=None, zoom: float = None):
+    """zoom<1 时只作用于「打印/导出 PDF」：等比缩小内容，
+    让原 PDF 的每一页尽量落在一张 A4 上（页数贴近原文件、减少半空白页）。
+    屏幕浏览（尤其是 html 产物）不受影响。"""
+    css = CSS
+    if zoom and zoom < 0.999:
+        css = css.replace('@media print{body{background:#fff;padding:0}',
+                          '@media print{body{background:#fff;padding:0;zoom:%.3f}' % zoom)
     W = doc.width - doc.margin_l - doc.margin_r
     body = []
     if doc.header:
@@ -495,7 +530,8 @@ def render_html(doc: Doc, path: str, progress=None):
     html = ('<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
             '<title>译文</title><style>%s</style></head><body><div class="page" '
             'style="width:%.1fcm;padding-left:%.2fcm;padding-right:%.2fcm">%s</div></body></html>'
-            % (CSS, doc.width / 28.35, doc.margin_l / 28.35, doc.margin_r / 28.35, '\n'.join(body)))
+            % (css, doc.width / 28.35, doc.margin_l / 28.35, doc.margin_r / 28.35,
+               '\n'.join(body)))
     open(path, 'w', encoding='utf-8').write(html)
     return path
 

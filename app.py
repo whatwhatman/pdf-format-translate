@@ -203,9 +203,6 @@ def run_pipeline(job: dict, pdf_path: str, cfg: dict):
         if 'pdf' in fmts or 'html' in fmts:
             html_path = base + '.译本.html'
             B.render_html(doc, html_path, progress=prog)
-            if 'html' in fmts:
-                job['files'].append({'name': os.path.basename(html_path),
-                                     'size': os.path.getsize(html_path)})
         if 'docx' in fmts:
             p = base + '.译本.docx'
             B.render_docx(doc, p, progress=prog)
@@ -215,10 +212,29 @@ def run_pipeline(job: dict, pdf_path: str, cfg: dict):
             log('正在用浏览器打印 PDF…')
             try:
                 B.render_pdf(doc, p, html_path=html_path)
+                # ── 自动适配：原 PDF 每页 97% 满时，译文常会溢出到下一页，
+                # 出现大量半空白页。这里量一下页数，超出就等比缩放重排一次，
+                # 让「译文第 N 页 ≈ 原文第 N 页」，最多重排一次（幂等、可控）。
+                try:
+                    import pymupdf as _fz
+                    src_pages = sum(1 for b in doc.blocks if b.t == 'pagebreak') + 1
+                    got = len(_fz.open(p))
+                    if src_pages and got > src_pages + 1:
+                        z = max(0.80, min(1.0, ((src_pages + 0.6) / got) ** 0.5))
+                        if z < 0.99:
+                            B.render_html(doc, html_path, zoom=z)
+                            B.render_pdf(doc, p, html_path=html_path)
+                            log('已按 %.0f%% 缩放重排：%d 页 → %d 页（原文件 %d 页）'
+                                % (z * 100, got, len(_fz.open(p)), src_pages))
+                except Exception as e:
+                    log('页数适配跳过：%s' % str(e)[:80])
                 job['files'].append({'name': os.path.basename(p),
                                      'size': os.path.getsize(p)})
             except Exception as e:
                 log('PDF 生成失败：%s' % str(e)[:120])
+        if 'html' in fmts:
+            job['files'].append({'name': os.path.basename(html_path),
+                                 'size': os.path.getsize(html_path)})
         job['done'] = True
         job['progress'] = 100
         job['message'] = '完成，用时 %.1f 秒' % (time.time() - t0)
@@ -533,7 +549,12 @@ def cli(argv):
     for f in j['files']:
         print('→', os.path.join(d, f['name']))
     if a.out and j['files']:
-        src = os.path.join(d, [f['name'] for f in j['files'] if f['name'].endswith('.docx')][0])
+        # 优先拷 PDF，其次 docx，最后取第一个（原先固定取 docx，
+        # 未勾选 docx 时会 IndexError 崩掉）
+        pick = ([f for f in j['files'] if f['name'].endswith('.pdf')]
+                or [f for f in j['files'] if f['name'].endswith('.docx')]
+                or j['files'])[0]
+        src = os.path.join(d, pick['name'])
         shutil.copy(src, a.out)
         print('copied →', a.out)
     if a.open and j['files']:
