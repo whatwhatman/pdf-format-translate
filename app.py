@@ -280,10 +280,10 @@ async def _bench_models(models, log):
                    'note': ''}
             async with sem:
                 try:
-                    r = await tr.probe(client, timeout=45)
+                    r = await tr.probe(client, timeout=45)      # 并发 3 批，测吞吐
                     row.update(r)
-                    if not r['ok']:
-                        row['note'] = '未输出中文（不建议）'
+                    if not r['ok'] and not row.get('note'):
+                        row['note'] = '探针未通过'
                 except asyncio.TimeoutError:
                     row['note'] = '超时（>45s）'
                 except Exception as e:

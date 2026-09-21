@@ -494,26 +494,49 @@ class CloudTranslator(Translator):
             data = json.loads(f.read().decode('utf-8'))
         return [m for m in data if m.get('enabled') is not False]
 
-    async def probe(self, client, timeout=45):
-        """测速探针：发一小批固定文本，返回 {ok, sec, ttft, note}。
+    async def probe(self, client, timeout=45, n=3):
+        """测速探针：**并发**发 n 批同样的短文本，返回并发下的表现。
 
-        用同一个提示词跑每个模型，比较「总耗时」与「首字延迟」；顺便校验
-        它是不是真的输出中文（有些模型会原样返回或输出英文）。
+        单批快不代表真快——网关会限流排队，真实任务是并发多批。
+        因此这里同时发 n 批，用「平均单批耗时」排名（与真实负载可比），
+        并记录首字延迟；顺便校验它是不是真的输出中文。
         """
         import time as _t
         items = {str(i): t for i, t in enumerate(PROBE_TEXTS)}
+
+        async def one():
+            t0 = _t.time()
+            box = []
+            try:
+                obj = await asyncio.wait_for(
+                    self._call(client, items, '法语', '简体中文', [], False,
+                               first_cb=lambda: box.append(_t.time() - t0)),
+                    timeout=timeout)
+            except asyncio.TimeoutError:
+                return {'sec': None, 'zh': 0, 'ttft': None, 'to': True}
+            except Exception as e:
+                return {'sec': None, 'zh': 0, 'ttft': None, 'err': str(e)[:60]}
+            vals = [str(obj.get(str(i), '')) for i in range(len(items))]
+            zh = sum(1 for v in vals if any('\u4e00' <= c <= '\u9fff' for c in v))
+            return {'sec': _t.time() - t0,
+                    'ttft': box[0] if box else None, 'zh': zh}
+
         t0 = _t.time()
-        box = []
-        obj = await asyncio.wait_for(
-            self._call(client, items, '法语', '简体中文', [], False,
-                       first_cb=lambda: box.append(_t.time() - t0)),
-            timeout=timeout)
-        sec = _t.time() - t0
-        vals = [str(obj.get(str(i), '')) for i in range(len(items))]
-        zh = sum(1 for v in vals if any('\u4e00' <= c <= '\u9fff' for c in v))
-        return {'ok': zh >= max(1, len(items) // 2), 'sec': round(sec, 2),
-                'ttft': round(box[0], 2) if box else None,
-                'zh': zh, 'n': len(items)}
+        res = await asyncio.gather(*[one() for _ in range(n)])
+        wall = _t.time() - t0
+        secs = [r['sec'] for r in res if r.get('sec')]
+        ttfts = [r['ttft'] for r in res if r.get('ttft')]
+        zh_ok = sum(1 for r in res if r.get('zh', 0) >= max(1, len(items) - 1))
+        to = sum(1 for r in res if r.get('to'))
+        errs = [r.get('err') for r in res if r.get('err')]
+        if not secs:
+            return {'ok': False, 'sec': None, 'ttft': None, 'wall': round(wall, 2),
+                    'n': n, 'note': '超时（>%ds）' % timeout if to else (errs[0] if errs else '无响应')}
+        ok = zh_ok >= (n + 1) // 2 and not to
+        return {'ok': ok, 'sec': round(sum(secs) / len(secs), 2),
+                'ttft': round(min(ttfts), 2) if ttfts else None,
+                'wall': round(wall, 2), 'n': n,
+                'note': '' if ok else ('未输出中文（不建议）' if not zh_ok else '部分批次超时')}
 
     async def _call(self, client, items, src, tgt, terms, strict=False,
                     first_cb=None):
