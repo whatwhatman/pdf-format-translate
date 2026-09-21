@@ -65,6 +65,16 @@ def load_cfg():
             c.update(json.load(open(CONFIG, encoding='utf-8')))
         except Exception:
             pass
+    # 一次性迁移：早期默认模型是 default，实测比 deepseek-v4-flash 慢约 10 倍
+    # （同负载 9 批×16 条：38~129s vs 5s）。老配置里的 default 自动升级。
+    if int(c.get('_cfg_version', 1)) < 2:
+        if str(c.get('model', '')).strip() in ('', 'default'):
+            c['model'] = DEFAULT_CFG['model']
+        c['_cfg_version'] = 2
+        try:
+            save_cfg(c)
+        except Exception:
+            pass
     return c
 
 
