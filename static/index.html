@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pdft · 原格式 PDF 翻译</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#f5f6f8; --card:#fff; --line:#e3e6ea; --ink:#1a1d21; --sub:#6b7280;
+  --brand:#2f6f4f; --brand-soft:#eaf3ee; --err:#b91c1c;
+  --radius:12px;
+  --font:-apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+}
+body{background:var(--bg);color:var(--ink);font-family:var(--font);font-size:14px;line-height:1.6;
+     min-height:100vh;padding:28px 20px 60px}
+.wrap{max-width:960px;margin:0 auto}
+header{display:flex;align-items:baseline;gap:12px;margin-bottom:22px}
+h1{font-size:20px;font-weight:650;letter-spacing:.3px}
+header .tag{font-size:12px;color:var(--sub)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+      padding:18px 20px;margin-bottom:16px}
+.card h2{font-size:13px;font-weight:600;color:var(--sub);letter-spacing:.6px;margin-bottom:12px}
+
+#drop{border:1.5px dashed #c8cdd4;border-radius:var(--radius);background:#fbfcfd;
+      padding:34px 20px;text-align:center;cursor:pointer;transition:.18s}
+#drop:hover,#drop.over{border-color:var(--brand);background:var(--brand-soft)}
+#drop .big{font-size:15px;font-weight:600;margin-bottom:6px}
+#drop .small{font-size:12.5px;color:var(--sub)}
+#file{margin-top:12px;font-size:13px;color:var(--brand);font-weight:600;display:none}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px 14px}
+label{display:block;font-size:12px;color:var(--sub);margin-bottom:4px}
+input,select{width:100%;padding:7px 10px;border:1px solid var(--line);border-radius:8px;
+             font-size:13px;font-family:inherit;background:#fff;color:var(--ink)}
+input:focus,select:focus{outline:none;border-color:var(--brand)}
+.hint{font-size:11.5px;color:var(--sub);margin-top:8px;line-height:1.7}
+.presets{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font-size:11.5px;padding:4px 10px;border:1px solid var(--line);border-radius:999px;
+      background:#fff;cursor:pointer;color:var(--sub)}
+.chip:hover{border-color:var(--brand);color:var(--brand)}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.seg{display:flex;gap:6px;flex-wrap:wrap}
+.seg button{flex:1;min-width:120px;padding:8px 6px;border:1px solid var(--line);background:#fff;
+  border-radius:9px;font-size:12.5px;font-family:inherit;color:var(--sub);cursor:pointer}
+.seg button.on{border-color:var(--brand);background:var(--brand-soft);color:var(--brand);font-weight:600}
+.checks{display:flex;gap:14px;padding-top:8px;flex-wrap:wrap}
+.ck{display:flex;align-items:center;gap:5px;font-size:13px;color:var(--ink);margin:0;cursor:pointer}
+.ck input{width:auto;margin:0}
+
+#run{display:none}
+.bar{height:7px;background:#eceff2;border-radius:99px;overflow:hidden;margin:6px 0 10px}
+.bar>i{display:block;height:100%;width:0;background:var(--brand);transition:width .35s ease}
+.status{font-size:13px;font-weight:600}
+.status .pct{float:right;color:var(--sub);font-weight:400}
+#logs{background:#12161a;color:#c9d3cd;border-radius:9px;padding:11px 13px;font-size:11.5px;
+      font-family:ui-monospace,SFMono-Regular,Menlo,monospace;max-height:190px;overflow:auto;
+      white-space:pre-wrap;line-height:1.65;margin-top:10px}
+#out{display:flex;flex-wrap:wrap;gap:10px;margin-top:14px}
+.dl{flex:1;min-width:190px;display:flex;align-items:center;gap:10px;padding:12px 14px;
+    border:1px solid var(--line);border-radius:10px;text-decoration:none;color:var(--ink);background:#fff}
+.dl:hover{border-color:var(--brand);background:var(--brand-soft)}
+.dl .ic{width:32px;height:32px;border-radius:7px;display:grid;place-items:center;
+        font-size:9.5px;font-weight:700;color:#fff;flex:none}
+.dl .ic.docx{background:#2b579a}.dl .ic.html{background:#c4552b}.dl .ic.pdf{background:#b02418}
+.dl .nm{font-size:13px;font-weight:600}
+.dl .sz{font-size:11px;color:var(--sub)}
+.err{color:var(--err);font-size:13px;margin-top:10px}
+details summary{cursor:pointer;font-size:12.5px;color:var(--sub);user-select:none}
+footer{text-align:center;font-size:11.5px;color:#9aa1a9;margin-top:26px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>pdft · 原格式 PDF 翻译</h1>
+    <span class="tag">上传即得「版式一致的中文译本」</span>
+  </header>
+
+  <div class="card">
+    <div id="drop">
+      <div class="big">拖入 PDF，或点击选择文件</div>
+      <div class="small">版式、色块、标题层级、公式位置全部保留；公式以高清方式原样呈现</div>
+      <input type="file" id="pick" accept="application/pdf,.pdf" hidden>
+      <div id="file"></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>翻译引擎</h2>
+    <div class="seg" id="engineSeg">
+      <button class="on" data-e="builtin">内置通道 · 免密钥</button>
+      <button data-e="custom">自备 API Key</button>
+      <button data-e="none">不翻译 · 仅转版式</button>
+    </div>
+    <div id="builtinBox" style="margin-top:14px">
+      <label>模型</label>
+      <select id="model"><option value="deepseek-v4-flash">DeepSeek-V4-Flash（快，推荐）</option></select>
+      <div class="hint">内置通道由 WorkBuddy 云服务提供，<strong>无需你配置任何密钥</strong>，
+        已接入 DeepSeek / GLM / Kimi / 混元等 30 个模型。</div>
+    </div>
+    <div id="customBox" style="display:none;margin-top:14px">
+      <div class="presets" id="presets">
+        <span class="chip" data-p="deepseek">DeepSeek</span>
+        <span class="chip" data-p="siliconflow">硅基流动</span>
+        <span class="chip" data-p="zhipu">智谱 GLM</span>
+        <span class="chip" data-p="aliyun">阿里云百炼</span>
+        <span class="chip" data-p="moonshot">月之暗面 Kimi</span>
+        <span class="chip" data-p="openai">OpenAI</span>
+      </div>
+      <div class="grid" style="margin-top:12px">
+        <div><label>API 地址 Base URL</label><input id="base_url" placeholder="https://api.deepseek.com/v1"></div>
+        <div><label>API Key</label><input id="api_key" type="password" placeholder="sk-..."></div>
+        <div><label>模型 Model</label><input id="custom_model" placeholder="deepseek-chat"></div>
+      </div>
+      <div class="hint">密钥只保存在本机 <code>~/.pdftool/config.json</code>。</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>输出设置</h2>
+    <div class="row2">
+      <div><label>原文语言</label><input id="src" value="法语"></div>
+      <div><label>目标语言</label><input id="tgt" value="简体中文"></div>
+    </div>
+    <div class="grid" style="margin-top:12px">
+      <div>
+        <label>公式处理</label>
+        <select id="mode">
+          <option value="faithful">保真（推荐 · 原样高清）</option>
+          <option value="editable">可编辑（重建 Word 公式）</option>
+        </select>
+      </div>
+      <div>
+        <label>渲染清晰度 DPI</label>
+        <select id="dpi">
+          <option value="200">200（体积小）</option>
+          <option value="300" selected>300（推荐）</option>
+          <option value="420">420（印刷级）</option>
+        </select>
+      </div>
+    </div>
+    <div class="row2" style="margin-top:12px">
+      <div>
+        <label>并发请求数</label>
+        <input id="concurrency" type="number" min="1" max="32" value="8">
+      </div>
+      <div>
+        <label>输出格式（可多选）</label>
+        <div class="checks">
+          <label class="ck"><input type="checkbox" id="f_docx" checked>Word .docx</label>
+          <label class="ck"><input type="checkbox" id="f_pdf" checked>PDF</label>
+          <label class="ck"><input type="checkbox" id="f_html">网页 .html</label>
+        </div>
+      </div>
+    </div>
+    <div class="hint">术语注释：专业词汇在<strong>首次出现</strong>处以括号附原文，全文不重复。<br>
+      PDF 由本机浏览器矢量打印，文字可选中可搜索。</div>
+  </div>
+
+  <div class="card" id="run">
+    <h2>进度</h2>
+    <div class="status"><span id="msg">准备中…</span><span class="pct" id="pct">0%</span></div>
+    <div class="bar"><i id="bar"></i></div>
+    <details open><summary>运行日志</summary><div id="logs"></div></details>
+    <div id="out"></div>
+    <div class="err" id="err"></div>
+  </div>
+
+  <footer>全本地解析 · 版式还原不依赖任何外部服务</footer>
+</div>
+
+<script>
+const PRESETS = {
+  deepseek:{base_url:'https://api.deepseek.com/v1', model:'deepseek-chat'},
+  siliconflow:{base_url:'https://api.siliconflow.cn/v1', model:'Qwen/Qwen2.5-72B-Instruct'},
+  zhipu:{base_url:'https://open.bigmodel.cn/api/paas/v4', model:'glm-4-flash'},
+  aliyun:{base_url:'https://dashscope.aliyuncs.com/compatible-mode/v1', model:'qwen-plus'},
+  moonshot:{base_url:'https://api.moonshot.cn/v1', model:'moonshot-v1-32k'},
+  openai:{base_url:'https://api.openai.com/v1', model:'gpt-4o-mini'},
+};
+const $ = s => document.querySelector(s);
+let cur = null;
+let ENGINE = 'builtin';
+
+// 载入已保存配置 + 内置模型列表
+Promise.all([fetch('/api/config').then(r=>r.json()), fetch('/api/models').then(r=>r.json())])
+  .then(([c, m])=>{
+    for (const k of ['base_url','api_key','custom_model','model','concurrency','src','tgt','mode','dpi'])
+      if (c[k] !== undefined && String(c[k]) !== '') $('#'+k).value = c[k];
+    if (c.api_key === '***已保存***') $('#api_key').placeholder = '已保存，留空即沿用';
+    const sel = $('#model');
+    const keep = c.model || 'deepseek-v4-flash';
+    sel.innerHTML = '';
+    (m.models || []).forEach(x=>{
+      const o = document.createElement('option');
+      o.value = x.id; o.textContent = x.desc ? (x.name + ' · ' + x.desc.slice(0,26)) : x.name;
+      sel.appendChild(o);
+    });
+    if (!sel.innerHTML){
+      const o = document.createElement('option'); o.value = 'deepseek-v4-flash'; o.textContent = 'DeepSeek-V4-Flash';
+      sel.appendChild(o);
+    }
+    sel.value = ([...sel.options].some(o=>o.value===keep)) ? keep : sel.options[0].value;
+    if (c.engine) setEngine(c.engine);
+    if (Array.isArray(c.formats)){
+      $('#f_docx').checked = c.formats.includes('docx');
+      $('#f_pdf').checked  = c.formats.includes('pdf');
+      $('#f_html').checked = c.formats.includes('html');
+    }
+  });
+
+function setEngine(e){
+  ENGINE = e;
+  document.querySelectorAll('#engineSeg button').forEach(b=>b.classList.toggle('on', b.dataset.e===e));
+  $('#builtinBox').style.display = e === 'builtin' ? '' : 'none';
+  $('#customBox').style.display  = e === 'custom'  ? '' : 'none';
+}
+$('#engineSeg').onclick = e => { const b = e.target.closest('button'); if (b) setEngine(b.dataset.e); };
+
+document.getElementById('presets').onclick = e => {
+  const t = e.target.closest('.chip'); if (!t) return;
+  const p = PRESETS[t.dataset.p]; if (!p) return;
+  $('#base_url').value = p.base_url; $('#custom_model').value = p.model;
+  document.querySelectorAll('.chip').forEach(c=>c.style.borderColor='');
+  t.style.borderColor = 'var(--brand)';
+  $('#api_key').focus();
+};
+
+const drop = $('#drop'), pick = $('#pick');
+drop.onclick = () => pick.click();
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over');
+                     if (e.dataTransfer.files[0]) choose(e.dataTransfer.files[0]); };
+pick.onchange = () => pick.files[0] && choose(pick.files[0]);
+
+function choose(f){
+  if (!/\.pdf$/i.test(f.name)) { alert('请选择 PDF 文件'); return; }
+  cur = f;
+  $('#file').style.display = 'block';
+  $('#file').textContent = '已选择：' + f.name + '（' + (f.size/1048576).toFixed(2) + ' MB）';
+  go();
+}
+
+function cfgJson(){
+  const c = {engine: ENGINE};
+  for (const k of ['base_url','api_key','custom_model','model','concurrency','src','tgt','mode','dpi'])
+    c[k] = $('#'+k).value;
+  c.formats = [];
+  if ($('#f_docx').checked) c.formats.push('docx');
+  if ($('#f_pdf').checked)  c.formats.push('pdf');
+  if ($('#f_html').checked) c.formats.push('html');
+  if (!c.formats.length) c.formats.push('docx');
+  return c;
+}
+
+async function go(){
+  $('#err').textContent = ''; $('#out').innerHTML = ''; $('#logs').textContent = '';
+  $('#run').style.display = 'block';
+  $('#msg').textContent = '正在上传…';
+  await fetch('/api/config', {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(cfgJson())});
+  const fd = new FormData();
+  fd.append('file', cur);
+  const r = await fetch('/api/upload', {method:'POST', body:fd});
+  const j = await r.json();
+  poll(j.job);
+}
+
+function fmt(n){
+  if (n > 1048576) return (n/1048576).toFixed(1) + ' MB';
+  return Math.round(n/1024) + ' KB';
+}
+
+async function poll(id){
+  let seen = 0;
+  while (true){
+    const j = await (await fetch('/api/job/'+id)).json();
+    $('#bar').style.width = j.progress + '%';
+    $('#pct').textContent = j.progress + '%';
+    $('#msg').textContent = j.message || '处理中…';
+    if (j.nlogs > seen){
+      const box = $('#logs');
+      const add = j.logs.slice(Math.max(0, j.logs.length - (j.nlogs - seen)));
+      box.textContent += (box.textContent ? '\n' : '') + add.join('\n');
+      box.scrollTop = box.scrollHeight;
+      seen = j.nlogs;
+    }
+    if (j.error) $('#err').textContent = '出错：' + j.error;
+    if (j.done){
+      for (const f of j.files){
+        const ext = f.name.endsWith('.docx') ? 'docx' : (f.name.endsWith('.pdf') ? 'pdf' : 'html');
+        const a = document.createElement('a');
+        a.className = 'dl';
+        a.href = '/api/file/' + id + '/' + encodeURIComponent(f.name);
+        a.innerHTML = '<span class="ic ' + ext + '">' + ext.toUpperCase() + '</span>' +
+          '<span><span class="nm">' + f.name + '</span><br><span class="sz">' +
+          fmt(f.size) + '</span></span>';
+        $('#out').appendChild(a);
+      }
+      $('#msg').textContent = j.error ? '失败' : '完成 ✓';
+      return;
+    }
+    await new Promise(r => setTimeout(r, 700));
+  }
+}
+</script>
+</body>
+</html>

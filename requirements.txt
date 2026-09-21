@@ -1,0 +1,10 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+python-multipart>=0.0.9
+httpx>=0.27
+pymupdf>=1.24
+python-docx>=1.1
+latex2mathml>=3.76
+mathml2omml>=0.0.2
+lxml>=5.0
+pillow>=10.0
