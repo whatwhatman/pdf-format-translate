@@ -9,7 +9,7 @@
 import asyncio, json, os, re, shutil, sys, threading, time, traceback, uuid
 from typing import Dict
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -74,6 +74,24 @@ DEFAULT_CFG = {
 }
 
 app = FastAPI(title='pdft')
+
+# 允许来自 GitHub Pages 等静态前端的跨域调用（前端部署在别处时用）。
+# 可用 CORS_ORIGINS 环境变量覆盖，逗号分隔；默认放行两类来源：
+#   - 本服务自身（同源，用于本地 static 页面）
+#   - https://*.github.io（GitHub Pages 前端）
+_CORS = os.environ.get('CORS_ORIGINS', '').strip()
+_ORIGINS = [o.strip() for o in _CORS.split(',') if o.strip()] or [
+    'https://pdf-translator.app.workbuddy.host',
+    'https://whatwhatman.github.io',
+]
+from fastapi.middleware.cors import CORSMiddleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_ORIGINS,
+    allow_origin_regex=r'https://[a-z0-9-]+\.github\.io',
+    allow_methods=['*'],
+    allow_headers=['*'],
+)
 
 
 def load_cfg():
@@ -389,7 +407,7 @@ def _cleanup_jobs():
 
 
 @app.post('/api/upload')
-async def upload(file: UploadFile = File(...)):
+async def upload(file: UploadFile = File(...), cfg_json: str = Form(None)):
     _cleanup_jobs()
     # 并发与存量控制
     running = sum(1 for j in JOBS.values() if not j.get('done'))
@@ -417,8 +435,18 @@ async def upload(file: UploadFile = File(...)):
     JOBS[jid] = {'dir': d, 'progress': 0, 'message': '排队中', 'logs': [],
                  'files': [], 'done': False, 'error': None, 'pdf': pdf,
                  'ts': time.time()}
-    cfg = load_cfg()
-    th = threading.Thread(target=_run_with_sem, args=(JOBS[jid], pdf, cfg), daemon=True)
+    job_cfg = load_cfg()
+    # 可选：随请求携带本次任务的设置（供 GitHub Pages 等外部静态前端使用）。
+    # 只作用于这一个任务，不改写服务器上的全局配置，避免多访客互相覆盖。
+    if cfg_json:
+        try:
+            sent = json.loads(cfg_json)
+            allowed = set(DEFAULT_CFG) | {'formats'}
+            job_cfg.update({k: v for k, v in sent.items()
+                            if k in allowed and v is not None})
+        except Exception as e:
+            JOBS[jid]['logs'].append('忽略无效的任务设置：%s' % str(e)[:80])
+    th = threading.Thread(target=_run_with_sem, args=(JOBS[jid], pdf, job_cfg), daemon=True)
     th.start()
     return {'job': jid}
 
