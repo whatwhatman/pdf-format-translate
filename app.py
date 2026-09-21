@@ -239,6 +239,117 @@ def get_models():
         return JSONResponse({'models': [], 'error': str(e)[:200]}, status_code=200)
 
 
+# ─────────────────── 模型测速（给用户推荐最快的那一个） ───────────────────
+SPEED_FILE = os.path.join(HOME, 'speed.json')
+SPEED_TTL = 15 * 60            # 测速结果 15 分钟内复用，不必反复烧额度
+SPEED = {'running': False, 'ts': 0, 'results': [], 'done': 0, 'total': 0,
+         'error': '', 'note': ''}
+
+
+def _load_speed():
+    try:
+        d = json.load(open(SPEED_FILE, encoding='utf-8'))
+        SPEED.update({k: d.get(k, SPEED[k]) for k in
+                      ('ts', 'results', 'done', 'total')})
+    except Exception:
+        pass
+
+
+def _save_speed():
+    try:
+        json.dump({'ts': SPEED['ts'], 'results': SPEED['results'],
+                   'done': SPEED['done'], 'total': SPEED['total']},
+                  open(SPEED_FILE, 'w', encoding='utf-8'),
+                  ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+async def _bench_models(models, log):
+    """并发给每个模型发一小批探针文本，记录耗时/首字延迟/是否真出中文。"""
+    import httpx
+    sem = asyncio.Semaphore(6)
+    SPEED['results'] = []
+
+    async with httpx.AsyncClient(trust_env=True, timeout=60) as client:
+        async def one(mid):
+            tr = T.CloudTranslator(endpoint=BUILTIN['endpoint'],
+                                   publishable_key=BUILTIN['publishable_key'],
+                                   model=mid, request_timeout=45)
+            row = {'id': mid, 'ok': False, 'sec': None, 'ttft': None,
+                   'note': ''}
+            async with sem:
+                try:
+                    r = await tr.probe(client, timeout=45)
+                    row.update(r)
+                    if not r['ok']:
+                        row['note'] = '未输出中文（不建议）'
+                except asyncio.TimeoutError:
+                    row['note'] = '超时（>45s）'
+                except Exception as e:
+                    row['note'] = str(e)[:60]
+            SPEED['results'].append(row)
+            SPEED['done'] += 1
+            return row
+
+        rows = await asyncio.gather(*[one(m) for m in models])
+    ok = [r for r in rows if r['ok'] and r['sec']]
+    ok.sort(key=lambda r: r['sec'])
+    SPEED['results'] = sorted(rows, key=lambda r: (not r['ok'],
+                                                  r['sec'] if r['sec'] else 9e9))
+    SPEED['ts'] = time.time()
+    if ok:
+        best = ok[0]['id']
+        SPEED['note'] = '最快：%s（%.1fs）' % (best, ok[0]['sec'])
+        log('模型测速完成，最快 %s（%.1fs）' % (best, ok[0]['sec']))
+    else:
+        SPEED['note'] = '全部模型均未通过探针'
+    _save_speed()
+    return SPEED['results']
+
+
+def _start_bench(force=False):
+    if SPEED['running']:
+        return False
+    SPEED['results'] = []
+    SPEED['done'] = 0
+    SPEED['total'] = 0
+    SPEED['error'] = ''
+    SPEED['running'] = True
+
+    def work():
+        try:
+            tr = T.CloudTranslator(endpoint=BUILTIN['endpoint'],
+                                   publishable_key=BUILTIN['publishable_key'])
+            ms = [m['id'] for m in tr.models()
+                  if m.get('id') not in ('hunyuan-image-v3.0',)]
+            SPEED['total'] = len(ms)
+            asyncio.run(_bench_models(ms, lambda m: None))
+        except Exception as e:
+            SPEED['error'] = str(e)[:200]
+        finally:
+            SPEED['running'] = False
+
+    threading.Thread(target=work, daemon=True).start()
+    return True
+
+
+@app.get('/api/speed')
+def get_speed(refresh: int = 0):
+    """模型测速状态与结果。refresh=1 强制重测（否则 15 分钟内复用缓存）。"""
+    if not SPEED['running']:          # 测速中不要用磁盘上的旧结果覆盖内存进度
+        _load_speed()
+    stale = (time.time() - SPEED.get('ts', 0)) > SPEED_TTL
+    if refresh or (stale and not SPEED['results'] and not SPEED['running']):
+        _start_bench(force=True)
+    best = next((r['id'] for r in SPEED['results'] if r['ok']), '')
+    return {'running': SPEED['running'], 'done': SPEED['done'],
+            'total': SPEED['total'], 'ts': SPEED['ts'], 'note': SPEED['note'],
+            'error': SPEED['error'], 'best': best,
+            'recommended': DEFAULT_CFG['model'],
+            'results': SPEED['results']}
+
+
 def _cleanup_jobs():
     """清理过期任务与僵尸上传。"""
     now = time.time()

@@ -460,6 +460,14 @@ class Translator:
         return out
 
 
+# 测速探针用的固定短文本（与真实任务同源的句子，长度接近，便于横向比较）
+PROBE_TEXTS = [
+    'La somme de deux nombres complexes est commutative et associative.',
+    'Le module du produit de deux nombres complexes est le produit des modules.',
+    'Pour tout nombre complexe non nul z, il existe un inverse égal à un sur z.',
+]
+
+
 class CloudTranslator(Translator):
     """WorkBuddy 云服务的免密钥大模型（用户无需自备 API Key）。
 
@@ -486,7 +494,29 @@ class CloudTranslator(Translator):
             data = json.loads(f.read().decode('utf-8'))
         return [m for m in data if m.get('enabled') is not False]
 
-    async def _call(self, client, items, src, tgt, terms, strict=False):
+    async def probe(self, client, timeout=45):
+        """测速探针：发一小批固定文本，返回 {ok, sec, ttft, note}。
+
+        用同一个提示词跑每个模型，比较「总耗时」与「首字延迟」；顺便校验
+        它是不是真的输出中文（有些模型会原样返回或输出英文）。
+        """
+        import time as _t
+        items = {str(i): t for i, t in enumerate(PROBE_TEXTS)}
+        t0 = _t.time()
+        box = []
+        obj = await asyncio.wait_for(
+            self._call(client, items, '法语', '简体中文', [], False,
+                       first_cb=lambda: box.append(_t.time() - t0)),
+            timeout=timeout)
+        sec = _t.time() - t0
+        vals = [str(obj.get(str(i), '')) for i in range(len(items))]
+        zh = sum(1 for v in vals if any('\u4e00' <= c <= '\u9fff' for c in v))
+        return {'ok': zh >= max(1, len(items) // 2), 'sec': round(sec, 2),
+                'ttft': round(box[0], 2) if box else None,
+                'zh': zh, 'n': len(items)}
+
+    async def _call(self, client, items, src, tgt, terms, strict=False,
+                    first_cb=None):
         system = ('你是精通 %s 和 %s 的学术技术文档译者，译文准确、通顺、术语一致。'
                   % (src, tgt))
         payload = {
@@ -516,6 +546,12 @@ class CloudTranslator(Translator):
                 chs = ch.get('choices') or [{}]
                 delta = chs[0].get('delta') or {}
                 if delta.get('content'):
+                    if first_cb is not None:
+                        try:
+                            first_cb()
+                        except Exception:
+                            pass
+                        first_cb = None
                     txt += delta['content']
         obj = None
         try:
