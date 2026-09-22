@@ -219,13 +219,27 @@ def run_pipeline(job: dict, pdf_path: str, cfg: dict):
                     import pymupdf as _fz
                     src_pages = sum(1 for b in doc.blocks if b.t == 'pagebreak') + 1
                     got = len(_fz.open(p))
-                    if src_pages and got > src_pages + 1:
-                        z = max(0.80, min(1.0, ((src_pages + 0.6) / got) ** 0.5))
-                        if z < 0.99:
-                            B.render_html(doc, html_path, zoom=z)
-                            B.render_pdf(doc, p, html_path=html_path)
-                            log('已按 %.0f%% 缩放重排：%d 页 → %d 页（原文件 %d 页）'
-                                % (z * 100, got, len(_fz.open(p)), src_pages))
+                    # ── 迭代重排：一轮缩放可能仍差一两页（强制分页把溢出内容
+                    # 推到下一页、留下半空页）。先按页数比估一档，仍不齐就再
+                    # 降 4%，直到页数对齐、页数不再下降或触到 80% 下限。
+                    z = min(0.97, max(0.80, ((src_pages + 0.4) / max(got, 1)) ** 0.5)) \
+                        if src_pages else 1.0
+                    prev_z = None
+                    for _ in range(4):
+                        if not (src_pages and got > src_pages) or z < 0.795:
+                            break
+                        if prev_z is not None:
+                            est = min(0.97, max(0.80, ((src_pages + 0.4) / max(got, 1)) ** 0.5))
+                            z = est if est < prev_z - 0.005 else max(0.80, prev_z - 0.04)
+                        prev_z = z
+                        B.render_html(doc, html_path, zoom=z)
+                        B.render_pdf(doc, p, html_path=html_path)
+                        new_got = len(_fz.open(p))
+                        log('已按 %.0f%% 缩放重排：%d 页 → %d 页（原文件 %d 页）'
+                            % (z * 100, got, new_got, src_pages))
+                        if new_got >= got:
+                            z -= 0.04          # 没起色 → 更激进地缩
+                        got = new_got
                 except Exception as e:
                     log('页数适配跳过：%s' % str(e)[:80])
                 job['files'].append({'name': os.path.basename(p),

@@ -51,17 +51,25 @@ def _formula_only(text: str, words=None) -> bool:
     """
     pool = _FORMULA_WORDS if words is None else words
     s = re.sub(r'[^a-zà-ÿ]', '', text.lower())
+    # ⚠️ 必须固定替换顺序（最长词优先）：pool 若是 set，迭代顺序随
+    # PYTHONHASHSEED 变化——'lim' 先被替换则并入数学区、先被 'im' 吃掉
+    # 则剩 'l' 判为文字，同一份 PDF 每次跑结果都可能不同！
+    words_sorted = sorted(pool, key=len, reverse=True)
     prev = None
     while prev != s:
         prev = s
-        for w in pool:
+        for w in words_sorted:
             s = s.replace(w, '')
     return not s
 
 # 行内公式区允许吞并的连接词/函数名（保持公式完整、不拆行）；
 # 排除 donc/avec/si/pour/ou/où 这类真正的句子词，它们要留给翻译
 _ZONE_WORDS = set('re im et mod arg cos sin tan cot ln log exp sup inf min max '
-                  'ch sh th'.split())
+                  'ch sh th '
+                  # lim/arccos… 也是正体排版的公式记号词：不并入数学区的话，
+                  # lim 的下标（θ→0）会被拆成孤立小图，「lim」留在文字里变成
+                  # 「因此 θlim [图]」这种断裂排版。
+                  'lim arccos arcsin arctan'.split())
 
 # 「值得裁图」的数学运算符：一个孤立的区若不含这些、也不含字母数字，
 # 就只是标点/分隔符（如页脚的 ·），应当当文字处理，否则会变成小块乱码
@@ -252,16 +260,63 @@ _SPAN_CACHE = {}
 
 
 def _page_spans(page):
-    """该页所有字符 span 的 (bbox, id)，供裁图时做「邻行字符遮挡」。"""
+    """该页所有字符 span 的 (bbox, id, 向上扩展量)，供裁图时做「邻行字符遮挡」。
+
+    向上扩展量：组合用重音符（如 U+20D7 向量箭头、U+0304 上划线）的墨迹画在
+    字母**上方**，但 span 的 bbox 通常只包住字母本身——不加这个扩展，邻行的
+    重音墨迹会漏进裁图（用户看到的"公式上方的奇怪小符号"）。
+    """
     key = id(page)
     hit = _SPAN_CACHE.get(key)
     if hit is None:
         out = []
         for bb, spans in _lines(page):
             for s in spans:
-                out.append((tuple(s['bbox']), id(s)))
+                up = 0.0
+                if any(0x300 <= ord(c) <= 0x36F or 0x20D0 <= ord(c) <= 0x20F0
+                       for c in s['text']):
+                    up = 0.6 * s['size']
+                out.append((tuple(s['bbox']), id(s), up))
         _SPAN_CACHE.clear()            # 只留当前页，避免累积
         _SPAN_CACHE[key] = out
+        hit = out
+    return hit
+
+
+_DRAW_CACHE = {}
+
+
+def _page_rules(page):
+    """该页所有「细线段」（框线、分隔线、分数线、根号横杆）的 (bbox, 是否细线)。
+
+    与 _page_spans 同理做缓存——_cropped 每裁一张图都要用，不能每次重新解析。
+    """
+    key = id(page)
+    hit = _DRAW_CACHE.get(key)
+    if hit is None:
+        out = []
+        try:
+            for dr in page.get_drawings():
+                for it in dr['items']:
+                    if it[0] != 'l':
+                        continue
+                    p0, p1 = it[1], it[2]
+                    x0, x1 = sorted((p0.x, p1.x))
+                    y0, y1 = sorted((p0.y, p1.y))
+                    # 水平/垂直线段的 bbox 有一个维度为 0，PyMuPDF 视其为「空矩形」，
+                    # intersects() 会直接返回 False（这正是框线一直漏进裁图的原因）。
+                    # 补 0.5pt 的“厚度”让相交判断可用。
+                    if y1 - y0 < 0.6:
+                        y0 -= 0.5
+                        y1 += 0.5
+                    if x1 - x0 < 0.6:
+                        x0 -= 0.5
+                        x1 += 0.5
+                    out.append((x0, y0, x1, y1))
+        except Exception:
+            out = []
+        _DRAW_CACHE.clear()
+        _DRAW_CACHE[key] = out
         hit = out
     return hit
 
@@ -294,30 +349,83 @@ def _cropped(page, bbox, dpi, own_ids=None):
             y0, y1 = max(0.0, min(y0, y1) - pad), min(float(H), max(y0, y1) + pad)
             return (x0, y0, x1, y1)
 
+        # ── 遮挡：把不属于本图的字符涂白，且绝不涂到公式本身 ──
+        # 外扩 0.8pt 很关键：字形墨迹常比声明 bbox 略大（斜体出挑、组合重音、
+        # 向量箭头），不外扩就会在公式图上留下"半截笔画/奇怪小符号"。
+        own_rect = {}
+        for sbb, sid, up in _page_spans(page):
+            if sid not in own_ids:
+                continue
+            r = pymupdf.Rect(sbb)
+            if up:
+                r = pymupdf.Rect(r.x0, r.y0 - up, r.x1, r.y1)
+            own_rect[sid] = r
+        core = None
+        for r in own_rect.values():
+            core = r if core is None else (core | r)
+        if core is not None:
+            core = pymupdf.Rect(core.x0 - 2.5, core.y0 - 2.5,
+                                core.x1 + 2.5, core.y1 + 2.5)
+
         mask = Image.new('L', img.size, 0)
         md = ImageDraw.Draw(mask)
         foreign = 0
-        for sbb, sid in _page_spans(page):
+        for sbb, sid, up in _page_spans(page):
             if sid in own_ids:
                 continue
-            r = pymupdf.Rect(sbb) & clip
+            r = pymupdf.Rect(sbb)
+            if up:
+                r = pymupdf.Rect(r.x0, r.y0 - up, r.x1, r.y1)
+            r = r & clip
             if r.is_empty or r.width < 0.2 or r.height < 0.2:
                 continue
-            x0, y0, x1, y1 = _px(r)
+            x0, y0, x1, y1 = _px(r, pad=0.8)
             if x1 - x0 < 0.5 or y1 - y0 < 0.5:
                 continue
             md.rectangle((x0, y0, x1, y1), fill=255)
             foreign += 1
-        if not foreign:
+        # 自己的字符区回填（外扩 1.2pt，压过上面外来的 0.8pt）
+        for r in own_rect.values():
+            rr = r & clip
+            if rr.is_empty:
+                continue
+            md.rectangle(_px(rr, pad=1.2), fill=0)
+
+        # 版式线条（定义框边框、分隔线）会被矩形裁图框进来，表现为公式上方/下方
+        # 一条多余的横线或竖线。做法：对「线条带」做像素级清理——只涂白彩色像素
+        # （框线是有色的）与浅色像素，黑色字迹照旧保留，即便框线穿过字也不会切字。
+        rules = 0
+        for (sx0, sy0, sx1, sy1) in _page_rules(page):
+            seg = pymupdf.Rect(sx0, sy0, sx1, sy1)
+            if min(seg.width, seg.height) > 4.0:      # 不是细线（填充块）→ 不动
+                continue
+            if not seg.intersects(clip):
+                continue
+            if core is not None and core.contains(seg):
+                continue                              # 属于本图内容（分数线等）
+            bx0, by0, bx1, by1 = _px(seg & clip, pad=1.4)
+            if bx1 - bx0 < 1 or by1 - by0 < 1:
+                continue
+            box = (int(bx0), int(by0), int(bx1), int(by1))
+            try:
+                from PIL import ImageChops
+                band = img.crop(box)
+                r_, g_, b_ = band.convert('RGB').split()
+                mx = ImageChops.lighter(ImageChops.lighter(r_, g_), b_)
+                mn = ImageChops.darker(ImageChops.darker(r_, g_), b_)
+                sat = ImageChops.subtract(mx, mn)              # 彩度
+                lum = band.convert('L')
+                chrome = Image.eval(sat, lambda v: 255 if v > 40 else 0)
+                light = Image.eval(lum, lambda v: 255 if v > 170 else 0)
+                cmask = ImageChops.lighter(chrome, light)
+                band.paste(Image.new('RGB', band.size, (255, 255, 255)),
+                           (0, 0), cmask)
+                img.paste(band, box)
+            except Exception:
+                md.rectangle((bx0, by0, bx1, by1), fill=255)
+            rules += 1
+        if not foreign and not rules:
             return raw
-        # 把自己的字符区域从遮挡里"挖掉"——绝不能涂到公式本身
-        for sbb, sid in _page_spans(page):
-            if sid not in own_ids:
-                continue
-            r = pymupdf.Rect(sbb) & clip
-            if r.is_empty:
-                continue
-            md.rectangle(_px(r, pad=0.35), fill=0)
         white = Image.new('RGB', img.size, (255, 255, 255))
         out = io.BytesIO()
         Image.composite(white, img, mask).save(out, 'PNG')
@@ -330,6 +438,40 @@ def _cropped(page, bbox, dpi, own_ids=None):
         except Exception:
             pass
         return raw
+
+def _norm_hf(txt):
+    """页眉/页脚比对用的归一化文本：数字→#，空白→空。
+
+    这样「… 1 / 7 …」「… 2 / 7 …」会被视作同一行，页脚才能被正确识别。
+    """
+    return re.sub(r'\s+', '', re.sub(r'\d+', '#', txt or ''))
+
+
+def _split_cols(spans, gap=12.0):
+    """把一行 span 按横向大间隙切成最多 3 组——页眉/页脚常是「左/中/右」三栏。
+
+    不切开的话，三栏会被当成一整行：页脚会变成
+    「BIFAST 2A · 2026/2027-S1」+「2 / 7」+「Seb Godillon」首尾相接的怪字符串。
+    """
+    if not spans:
+        return [spans]
+    ss = sorted(spans, key=lambda s: s['bbox'][0])
+    groups, cur = [], [ss[0]]
+    for s in ss[1:]:
+        if s['bbox'][0] - cur[-1]['bbox'][2] > gap:
+            groups.append(cur)
+            cur = [s]
+        else:
+            cur.append(s)
+    groups.append(cur)
+    if len(groups) <= 3:
+        return groups
+    n = len(groups)
+    out = [[], [], []]
+    for i, g in enumerate(groups):
+        out[min(2, i * 3 // n)].extend(g)
+    return [g for g in out if g]
+
 
 def _lines(page):
     out = []
@@ -510,10 +652,23 @@ def _build_para(line_group, doc, page, mode, dpi):
     merge_math = False
     mbox_all = None
     if len(line_group) >= 2 and math_spans:
+        # ⚠️ 真·跨行结构（cases/矩阵）的每一行**只有公式**；若是「每个伪行
+        # 都跟着正文文字」的列表项（- Si q1q2<0 les deux… / - Si q1q2>0 …），
+        # 合并会把两个列表项的公式缝成一张假 cases 图、文字被拦腰截断。
+        _word_re = re.compile(r'[A-Za-zÀ-ÿ]{2,}')
+        lines_have_prose = 0
+        for _, ss in line_group:
+            txt = ''.join(sp['text'] for sp in ss
+                          if not (any(_is_math_char(c) for c in sp['text']) or
+                                  (_MATH_FAMILY.match(_family(sp['font'])) and
+                                   _family(sp['font']) != body_font_root)))
+            words = [w for w in _word_re.findall(txt) if w.lower() not in _ZONE_WORDS]
+            if len(' '.join(words)) >= 6:
+                lines_have_prose += 1
         my0 = min(s['bbox'][1] for s in math_spans)
         my1 = max(s['bbox'][3] for s in math_spans)
         h_line = max((g[0][3] - g[0][1]) for g in line_group) or 1
-        if my1 - my0 > 1.7 * h_line:
+        if lines_have_prose < len(line_group) and my1 - my0 > 1.7 * h_line:
             bx0 = min(s['bbox'][0] for s in math_spans)
             bx1 = max(s['bbox'][2] for s in math_spans)
             area = max(1e-6, (bx1 - bx0) * (my1 - my0))
@@ -630,14 +785,25 @@ def _build_para(line_group, doc, page, mode, dpi):
         for ism, zsp in reduced:
             if not ism:
                 buf, b_b, b_i = [], None, None
+                prev_x1 = None
                 for s in zsp:
                     sb = 'Bold' in s['font'] or 'black' in s['font'].lower()
                     si = 'Italic' in s['font'] or 'Oblique' in s['font']
+                    # 同一基线带里两个 span 横向间隙明显（> 0.3 倍字高）时补一个
+                    # 空格——band 合并把「节号 2」这类独立伪行并进主行后，span
+                    # 之间没有空格字符，直接 join 会得到「2Fonctions」这种粘连。
+                    if buf and prev_x1 is not None and s['text'] \
+                            and not s['text'][0].isspace() \
+                            and buf and buf[-1] and not buf[-1][-1].isspace():
+                        size = s.get('size') or 10.0
+                        if s['bbox'][0] - prev_x1 > 0.3 * max(6.0, size):
+                            buf.append(' ')
                     if sb != b_b or si != b_i:
                         if buf:
                             add_text(''.join(buf), b_b or False, b_i or False)
                         buf, b_b, b_i = [], sb, si
                     buf.append(s['text'])
+                    prev_x1 = s['bbox'][2]
                 if buf:
                     add_text(''.join(buf), b_b or False, b_i or False)
                 continue
@@ -791,7 +957,10 @@ def extract(path: str, mode: str = 'faithful', dpi: int = 300, progress=None) ->
             if not txt or len(txt) > 140:
                 continue
             if bb[1] < doc.height * 0.14 or bb[1] > doc.height * 0.86:
-                sig.setdefault(txt, []).append(i)
+                # 页码逐页变化，整行文本不重复——把数字归一成 # 再比对，
+                # 否则「BIFAST 2A · 2026/2027-S1  2 / 7  Seb Godillon」这类页脚
+                # 会被当成正文，三栏首尾相接成怪字符串（用户报的"字符丢失"）。
+                sig.setdefault(_norm_hf(txt), []).append(i)
     rep = {k for k, v in sig.items() if len(v) >= max(2, int(n * 0.6))}
     doc.has_pagenum = False
 
@@ -802,8 +971,12 @@ def extract(path: str, mode: str = 'faithful', dpi: int = 300, progress=None) ->
         # 登记本页 span（对象级），供 _cropped 的邻行遮挡使用：
         # 必须与主流程共用同一批 span 对象，否则 id 对不上会把公式本身涂白
         _SPAN_CACHE.clear()
-        _SPAN_CACHE[id(page)] = [(tuple(s['bbox']), id(s))
-                                 for _, ss in lines for s in ss]
+        _SPAN_CACHE[id(page)] = [
+            (tuple(s['bbox']), id(s),
+             0.6 * s['size'] if any(0x300 <= ord(c) <= 0x36F or
+                                    0x20D0 <= ord(c) <= 0x20F0 for c in s['text']) else 0.0)
+            for _, ss in lines for s in ss]
+        _DRAW_CACHE.clear()          # 版式线条缓存也只留当前页
         boxes = _find_boxes(page, maxx - minx)
 
         def container(bb):
@@ -921,6 +1094,36 @@ def extract(path: str, mode: str = 'faithful', dpi: int = 300, progress=None) ->
                                   max(lines[i][0][3] for i in idxs), _ids))
                 zone_lines.update(idxs)
 
+        # ── 嵌入位图（照片、示意图）：此前完全被忽略，译本会整图丢失。
+        # 每张图当成一个「挖块」走同一管线（容器归属、排序、整块裁剪渲染），
+        # 图内的标注文字（中心落在图内的行）跟随图片，不再进正文。 ──
+        try:
+            seen_xref = set()
+            page_area = doc.width * doc.height
+            for _img in page.get_images(full=True):
+                xref = _img[0]
+                if xref in seen_xref:
+                    continue
+                seen_xref.add(xref)
+                for r in page.get_image_rects(xref):
+                    w, h = r.width, r.height
+                    if w < 40 or h < 40 or w * h < 3000:
+                        continue                       # 图标、装饰点
+                    if w * h > 0.85 * page_area:
+                        continue                       # 整页背景（幻灯片常见）
+                    bbox = (r.x0, r.y0, r.x1, r.y1)
+                    _ids, drop = set(), set()
+                    for k, (lbb, lsp) in enumerate(lines):
+                        cx = (lbb[0] + lbb[2]) / 2
+                        cy = (lbb[1] + lbb[3]) / 2
+                        if r.x0 - 2 <= cx <= r.x1 + 2 and r.y0 - 2 <= cy <= r.y1 + 2:
+                            _ids.update(id(sp) for sp in lsp)
+                            drop.add(k)                # 图内标注文字跟图走
+                    dug_boxes.append((r.x0, r.y0, r.x1, r.y1, _ids))
+                    zone_lines.update(drop)
+        except Exception:
+            pass
+
         if zone_lines:
             lines = [ln for k, ln in enumerate(lines) if k not in zone_lines]
             kinds = [k for q, k in enumerate(kinds) if q not in zone_lines]
@@ -966,10 +1169,22 @@ def extract(path: str, mode: str = 'faithful', dpi: int = 300, progress=None) ->
             txt = ''.join(s['text'] for s in spans).strip()
             if not txt:
                 continue
-            if txt in rep and (bb[1] < doc.height * 0.14 or bb[1] > doc.height * 0.86):
-                blk = _build_para([(bb, spans)], doc, page, mode, dpi)
-                if blk:
-                    (doc.header if bb[1] < doc.height * 0.5 else doc.footer).append(blk)
+            if _norm_hf(txt) in rep and (bb[1] < doc.height * 0.14 or bb[1] > doc.height * 0.86):
+                # 页眉/页脚常是「左 / 中 / 右」三栏：按横向大间隙切开，各成一栏，
+                # 否则三栏会被拼成一串（页脚出现 “S12 / 7Seb” 这种怪字符）
+                target = doc.header if bb[1] < doc.height * 0.5 else doc.footer
+                for grp in _split_cols(spans):
+                    # 页码那一栏不留文本（否则每页的「1 / 7」「2 / 7」都会堆进来），
+                    # 只记一个标记，由渲染层生成 Word 域 / 自动页码
+                    gtxt = ''.join(s['text'] for s in grp).strip()
+                    if _PAGE_NUM.match(gtxt):
+                        doc.has_pagenum = True
+                        continue
+                    gb = (min(s['bbox'][0] for s in grp), bb[1],
+                          max(s['bbox'][2] for s in grp), bb[3])
+                    blk = _build_para([(gb, grp)], doc, page, mode, dpi)
+                    if blk:
+                        target.append(blk)
                 continue
             # 页边缘的纯页码：不进正文，改由 Word 的 PAGE/NUMPAGES 域生成
             if _PAGE_NUM.match(txt) and (bb[3] > doc.height * 0.90 or bb[1] < doc.height * 0.10):

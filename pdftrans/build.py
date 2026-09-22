@@ -303,23 +303,58 @@ def render_docx(doc: Doc, path: str, progress=None):
     nor.font.size = Pt(doc.body_size); nor.font.name = _body_latin
     nor.element.rPr.rFonts.set(qn('w:eastAsia'), _body_cjk)
 
-    # 页眉
+    # ── 页眉/页脚：支持「左 / 中 / 右」三栏（原 PDF 的三栏结构）──
+    def _hf_parts(blocks, n=3):
+        out = []
+        for b in blocks[:n]:
+            out.append(' '.join(seg[1] for seg in parse_template(b.template, b.refs)
+                                if seg[0] == 'text').strip())
+        return out
+
+    def _pagenum_like(t):
+        return bool(re.match(r'^\s*\d{1,4}\s*(?:[/|·]\s*\d{1,4})?\s*$', t or ''))
+
     if doc.header:
-        hp = s.header.paragraphs[0]; _clear(hp)
+        parts = _hf_parts(doc.header)
+        hp = s.header.paragraphs[0]
+        _clear(hp)
         hp = s.header.add_paragraph()
+        hp.paragraph_format.tab_stops.add_tab_stop(Cm(TW / 2), WD_TAB_ALIGNMENT.CENTER)
         hp.paragraph_format.tab_stops.add_tab_stop(Cm(TW), WD_TAB_ALIGNMENT.RIGHT)
-        parts = [' '.join(seg[1] for seg in parse_template(b.template, b.refs) if seg[0] == 'text')
-                 for b in doc.header[:2]]
-        if parts:
-            hp.add_run(_xml_safe(parts[0]) + '\t' + _xml_safe(parts[1] if len(parts) > 1 else ''))
-    # 页脚：左＝原页脚文字（首段），右＝页码 n / N（原生域）
-    fp = s.footer.paragraphs[0]; _clear(fp)
+        if len(parts) >= 3:
+            txt = '%s\t%s\t%s' % (parts[0], parts[1], parts[2])
+        elif len(parts) == 2:
+            txt = '%s\t%s' % (parts[0], parts[1])
+        else:
+            txt = (parts[0] if parts else '') + '\t'
+        hp.add_run(_xml_safe(txt))
+    # 页脚：三栏；中间那栏原文是页码就替换成 Word 原生 PAGE/NUMPAGES 域
+    fp = s.footer.paragraphs[0]
+    _clear(fp)
     fp = s.footer.add_paragraph()
+    fp.paragraph_format.tab_stops.add_tab_stop(Cm(TW / 2), WD_TAB_ALIGNMENT.CENTER)
     fp.paragraph_format.tab_stops.add_tab_stop(Cm(TW), WD_TAB_ALIGNMENT.RIGHT)
-    left = ' '.join(''.join(seg[1] for seg in parse_template(b.template, b.refs)
-                            if seg[0] == 'text') for b in doc.footer[:1])
-    r = fp.add_run(_xml_safe(left) + '\t'); _set_run(r, size=9)
-    _field(fp, 'PAGE'); r = fp.add_run(' / '); _set_run(r, size=9); _field(fp, 'NUMPAGES')
+    parts = _hf_parts(doc.footer)
+
+    def _page_field(p):
+        _field(p, 'PAGE')
+        r2 = p.add_run(' / '); _set_run(r2, size=9)
+        _field(p, 'NUMPAGES')
+
+    if len(parts) >= 3:
+        r = fp.add_run(_xml_safe(parts[0]) + '\t'); _set_run(r, size=9)
+        if _pagenum_like(parts[1]):
+            _page_field(fp)
+        else:
+            r = fp.add_run(_xml_safe(parts[1]) + '\t'); _set_run(r, size=9)
+        r = fp.add_run('\t' + _xml_safe(parts[2])); _set_run(r, size=9)
+    elif len(parts) == 2:
+        r = fp.add_run(_xml_safe(parts[0]) + '\t'); _set_run(r, size=9)
+        _page_field(fp)
+        r = fp.add_run('\t' + _xml_safe(parts[1])); _set_run(r, size=9)
+    else:
+        r = fp.add_run(_xml_safe(parts[0] if parts else '') + '\t'); _set_run(r, size=9)
+        _page_field(fp)
 
     def box(container, blk, nested=False):
         if blk.style == 'frame':
@@ -378,6 +413,9 @@ body{margin:0;padding:22px 0;background:#eef0f3;color:#111;
  box-shadow:0 1px 6px rgba(0,0,0,.15)}
 .runhead,.runfoot{display:flex;justify-content:space-between;font-size:11.5px;color:#333;
  border-bottom:.6px solid #000;padding-bottom:4px;margin-bottom:16px;gap:20px}
+.runhead>span,.runfoot>span{white-space:nowrap}
+/* 三栏页眉/页脚：中间那栏真正居中 */
+.runhead>span:nth-child(2),.runfoot>span:nth-child(2){flex:1;text-align:center}
 .runfoot{border-bottom:none;border-top:.6px solid #000;margin:20px 0 0;padding-top:4px}
 p{margin:5px 0;text-align:justify}
 h2,h3,h4{font-family:"Heiti SC","黑体",sans-serif;line-height:1.35;margin:14px 0 6px;color:#111}
@@ -399,7 +437,10 @@ img.mmath{vertical-align:-2px}
  .pbreak{page-break-after:always;break-after:page}
  .box,table,tr{break-inside:avoid}
  h1,h2,h3,h4{break-after:avoid}
- @page{size:A4;margin:1.8cm 2.1cm 1.5cm}}
+ /* 页眉/页脚：打印时隐藏，改由 render_pdf() 用 PyMuPDF 逐页盖章
+    （CSS 的 fixed 定位在缩放打印下位置会错乱，实测页眉会跑到页面底部） */
+ .runhead,.runfoot{display:none}
+ @page{size:A4;margin:2.0cm 2.1cm 2.0cm}}
 """
 
 def _seg_html(kind, rest, strip_lead_flag):
@@ -512,21 +553,30 @@ def render_html(doc: Doc, path: str, progress=None, zoom: float = None):
     W = doc.width - doc.margin_l - doc.margin_r
     body = []
     if doc.header:
-        hs = [_html_segs(b) for b in doc.header]
-        if len(hs) == 1:
+        hs = [_html_segs(b) for b in doc.header][:3]
+        while len(hs) < 2:
             hs.append('')
-        body.append('<div class="runhead"><span>%s</span><span>%s</span></div>' % (hs[0], hs[1]))
+        body.append('<div class="runhead">%s</div>'
+                    % ''.join('<span>%s</span>' % h for h in hs))
     body.append(_html_blocks(doc.blocks, doc))
     if doc.footer or doc.has_pagenum:
-        fs = [_html_segs(b) for b in doc.footer]
+        fs = [_html_segs(b) for b in doc.footer][:3]
         fs = [f for f in fs if f.strip()]
-        if not fs:
-            fs = ['', '']
-        if len(fs) == 1:
+        while len(fs) < 2:
             fs.append('')
         if doc.has_pagenum:
-            fs[-1] = (fs[-1] + ' &nbsp;&nbsp; 1 / %d' % doc.pages).strip()
-        body.append('<div class="runfoot"><span>%s</span><span>%s</span></div>' % (fs[0], fs[1]))
+            # 页码放中间（与原 PDF 的「左 / 中 / 右」三栏一致）。
+            # 注意：HTML/PDF 是静态页面，拿不到"当前第几页"，硬写会每页都一样；
+            # 真实页码只在 DOCX 里用 Word 的 PAGE/NUMPAGES 域给出。
+            pn = ''
+            if len(fs) >= 3:
+                fs = [fs[0], pn, fs[2]]
+            elif len(fs) == 2:
+                fs = [fs[0], pn, fs[1]]
+            else:
+                fs = fs + [pn]
+        body.append('<div class="runfoot">%s</div>'
+                    % ''.join('<span>%s</span>' % f for f in fs))
     html = ('<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">'
             '<title>译文</title><style>%s</style></head><body><div class="page" '
             'style="width:%.1fcm;padding-left:%.2fcm;padding-right:%.2fcm">%s</div></body></html>'
@@ -615,7 +665,108 @@ def render_pdf(doc: Doc, path: str, html_path: str = None, timeout=180):
     if not os.path.exists(out):
         # 浏览器打印失败（服务器环境常见）→ 退到内置排版引擎
         render_pdf_story(tmp, out)
+    try:
+        stamp_running(doc, out)
+    except Exception:
+        pass
     return out
+
+
+def _hf_text(blocks, n=3):
+    out = []
+    for b in blocks[:n]:
+        out.append(' '.join(seg[1] for seg in parse_template(b.template, b.refs)
+                            if seg[0] == 'text').strip())
+    return out
+
+
+def stamp_running(doc: Doc, pdf_path: str):
+    """给 PDF 每一页盖页眉/页脚（左/中/右三栏 + 真实页码）。
+
+    为什么不在 HTML 里做：CSS 的 position:fixed 在 Chrome 缩放打印下位置会错乱
+    （实测页眉跑到页面底部），而静态 HTML 又拿不到"当前第几页"。生成 PDF 后
+    逐页盖章最稳，还能给出真实页码 "n / N"。
+    """
+    import pymupdf
+    d = pymupdf.open(pdf_path)
+    n = len(d)
+    hd, ft = _hf_text(doc.header), _hf_text(doc.footer)
+    if not hd and not ft and not doc.has_pagenum:
+        return pdf_path
+    FONT = 'china-ss'          # PyMuPDF 内置简体宋体，中英混排都能画
+    FS = 9
+    for i, page in enumerate(d):
+        W, H = page.rect.width, page.rect.height
+        ml = max(28.0, doc.margin_l * 0.85)
+        mr = W - max(28.0, doc.margin_r * 0.85)
+        mid = (ml + mr) / 2
+
+        def put(txt, x, y, align='left', fs=FS):
+            if not txt:
+                return
+            w = pymupdf.get_text_length(txt, fontname=FONT, fontsize=fs)
+            if align == 'right':
+                x -= w
+            elif align == 'center':
+                x -= w / 2
+            page.insert_text((x, y), txt, fontname=FONT, fontsize=fs, color=(0.2, 0.2, 0.2))
+
+        def fit(txt, avail, fs=FS):
+            """左侧文字可用宽度不够时按比例缩小字号（宋体偏宽，长页眉会压到右栏）。"""
+            if not txt:
+                return fs
+            w = pymupdf.get_text_length(txt, fontname=FONT, fontsize=fs)
+            return max(5.5, min(fs, fs * avail / w)) if w > avail else fs
+
+        # 页眉：左 / 右（原档多为两栏），下方一条细线
+        if hd:
+            y = 34
+            if len(hd) >= 3:
+                wm = pymupdf.get_text_length(hd[1], fontname=FONT, fontsize=FS)
+                wr = pymupdf.get_text_length(hd[2], fontname=FONT, fontsize=FS)
+                gap = (mr - ml - wr - wm) / 2
+                fs_m = fit(hd[1], max(30, gap), FS)
+                fs_l = fit(hd[0], max(40, (mr - ml) - wr - wm - 8), FS)
+                put(hd[0], ml, y, fs=fs_l)
+                put(hd[1], mid, y, 'center', fs_m)
+                put(hd[2], mr, y, 'right')
+            elif len(hd) == 2:
+                fs_l = fit(hd[0], max(40, (mr - ml) -
+                                      pymupdf.get_text_length(hd[1], fontname=FONT,
+                                                              fontsize=FS) - 8), FS)
+                put(hd[0], ml, y, fs=fs_l)
+                put(hd[1], mr, y, 'right')
+            page.draw_line(pymupdf.Point(ml, y + 5), pymupdf.Point(mr, y + 5),
+                           color=(0, 0, 0), width=0.5)
+        # 页脚：左 / 页码 / 右，上方一条细线
+        if ft or doc.has_pagenum:
+            y = H - 30
+            page.draw_line(pymupdf.Point(ml, y - 12), pymupdf.Point(mr, y - 12),
+                           color=(0, 0, 0), width=0.5)
+            pn = '%d / %d' % (i + 1, n) if doc.has_pagenum else ''
+            wpn = pymupdf.get_text_length(pn, fontname=FONT, fontsize=FS) if pn else 0
+            if len(ft) >= 3:
+                fs_l = fit(ft[0], max(40, (mr - ml) - wpn -
+                                      pymupdf.get_text_length(ft[2], fontname=FONT,
+                                                              fontsize=FS) - 16), FS)
+                put(ft[0], ml, y, fs=fs_l)
+                put(ft[2], mr, y, 'right')
+            elif len(ft) == 2:
+                fs_l = fit(ft[0], max(40, (mr - ml) - wpn -
+                                      pymupdf.get_text_length(ft[1], fontname=FONT,
+                                                              fontsize=FS) - 16), FS)
+                put(ft[0], ml, y, fs=fs_l)
+                put(ft[1], mr, y, 'right')
+            elif len(ft) == 1:
+                fs_l = fit(ft[0], max(40, (mr - ml) - wpn - 16), FS)
+                put(ft[0], ml, y, fs=fs_l)
+            if doc.has_pagenum:
+                put(pn, mid, y, 'center')
+    tmp = pdf_path + '.stamped'
+    d.save(tmp, garbage=0, deflate=True)
+    d.close()
+    os.replace(tmp, pdf_path)
+    return pdf_path
 
 def _html_box(blk, doc=None):
     """盒子（tcolorbox）→ HTML，盒内同样支持列表分组。"""
