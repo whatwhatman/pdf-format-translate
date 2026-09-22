@@ -7,7 +7,7 @@
 * 先跑首批构建「已括注术语表」，再并行处理剩余批次，既保持术语一致，又不会重复注释。
 * 结果按原文内容哈希缓存，重跑同一份 PDF 秒级返回。
 """
-import asyncio, hashlib, json, os, re, time
+import asyncio, base64, hashlib, json, os, re, time
 from typing import Callable, Dict, List
 
 import httpx
@@ -493,6 +493,50 @@ class CloudTranslator(Translator):
         with urllib.request.urlopen(r, timeout=30) as f:
             data = json.loads(f.read().decode('utf-8'))
         return [m for m in data if m.get('enabled') is not False]
+
+    async def vision_page(self, client, png_bytes, prompt, model=None,
+                          timeout=None, system=None):
+        """把整页图片直接交给视觉模型（云 OCR 的上位替代）。
+
+        为什么不用 OCR：数学讲义经 Tesseract 后 θ→0、∀θ∈]0,π/2[→"vo e]0, Zb"，
+        公式结构（分数、上下标、根号）全部丢失；视觉模型能直接读出
+        re^{iφ}、∀θ∈]0,π/2] 这类结构，比 OCR + 文本管道高一个数量级。
+        """
+        b64 = base64.b64encode(png_bytes).decode()
+        payload = {
+            'model': model or self.model,
+            'stream': True,
+            'messages': [
+                {'role': 'system',
+                 'content': system or '你是精通法语和简体中文的学术技术文档译者。'},
+                {'role': 'user', 'content': [
+                    {'type': 'text', 'text': prompt},
+                    {'type': 'image_url',
+                     'image_url': {'url': 'data:image/png;base64,' + b64}}]}],
+            'temperature': 0.1,
+        }
+        url = self.endpoint + '/.cloud/llm/chat/completions'
+        headers = {self.header: self.publishable_key,
+                   'Accept': 'text/event-stream'}
+        txt = ''
+        async with client.stream('POST', url, json=payload, headers=headers,
+                                 timeout=timeout or max(180, self.request_timeout)) as r:
+            r.raise_for_status()
+            async for line in r.aiter_lines():
+                if not line.startswith('data:'):
+                    continue
+                d = line[5:].strip()
+                if not d or d == '[DONE]':
+                    continue
+                try:
+                    ch = json.loads(d)
+                except Exception:
+                    continue
+                chs = ch.get('choices') or [{}]
+                delta = chs[0].get('delta') or {}
+                if delta.get('content'):
+                    txt += delta['content']
+        return txt
 
     async def probe(self, client, timeout=45, n=3):
         """测速探针：**并发**发 n 批同样的短文本，返回并发下的表现。

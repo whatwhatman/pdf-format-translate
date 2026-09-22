@@ -35,7 +35,11 @@ BULLETS = '•●○▪▫■□◦‣∙⋅·'
 
 # 公式连接词：出现在公式内部的罗马字词（Re、Im、et、où…）。
 # 段落的普通文本若全部由这些词构成，则整段按一块高清图输出，保住多行公式的对齐。
-_FORMULA_WORDS = set(('re im et où ou avec si pour donc arg cos sin tan ln log exp '
+# ⚠️ 'et'/'où' 已移出（2026-09-22 实测）：两者是真正的句子连接词——
+# 「… où {cases}」「A et B」整段成图后 'où'/'et' 被关进图里，译文残留法文。
+# 移出后它们留在文字流里翻成「其中/和」；跨行 cases 的对齐由 merge_math
+# （跨行数学结构检测）兜底，不受影响。
+_FORMULA_WORDS = set(('re im ou avec si pour donc arg cos sin tan ln log exp '
                       'mod min max sup inf sh ch th').split())
 
 # 页码：1 / 12、- 3 -、3
@@ -63,8 +67,11 @@ def _formula_only(text: str, words=None) -> bool:
     return not s
 
 # 行内公式区允许吞并的连接词/函数名（保持公式完整、不拆行）；
-# 排除 donc/avec/si/pour/ou/où 这类真正的句子词，它们要留给翻译
-_ZONE_WORDS = set('re im et mod arg cos sin tan cot ln log exp sup inf min max '
+# 排除 donc/avec/si/pour/ou/où 这类真正的句子词，它们要留给翻译。
+# ⚠️ 'et' 也已移出：它是句子连接词（「ℂ…, ℝ… et ℤ…」「cos(θ) et sin(θ)」），
+# 并进数学区会随公式一起裁成图，译文里残留法文「et」（实测 3 处）。
+# 移出后两个公式图之间的「et」留在文字流里翻成「和」，公式本身不受影响。
+_ZONE_WORDS = set('re im mod arg cos sin tan cot ln log exp sup inf min max '
                   'ch sh th '
                   # lim/arccos… 也是正体排版的公式记号词：不并入数学区的话，
                   # lim 的下标（θ→0）会被拆成孤立小图，「lim」留在文字里变成
@@ -94,6 +101,14 @@ def _line_kind(spans, body_root):
         if any(_is_math_char(c) for c in s['text']) or \
            (_MATH_FAMILY.match(fam) and fam != body_root):
             has_math = True
+            # 句末标点偶尔用数学字体排（LaTeX 的 display 数学后的句号落在
+            # CMMI 里）。它不代表公式真实宽度，不能纳入数学区边界——否则
+            # 「续行并入」的横向重叠判定会被一个孤立句号拉爆，把上一行公式
+            # 错误并进带右侧文字注释的行，x 序重排后文字与公式碎片互相穿插
+            # （例 3.4 实测：整段推导被搅成乱码）。
+            st = s['text'].strip()
+            if st and all(c in _SENTENCE_PUNCT for c in st):
+                continue
             mx0 = min(mx0, s['bbox'][0])
             mx1 = max(mx1, s['bbox'][2])
         else:
@@ -621,6 +636,32 @@ def _build_para(line_group, doc, page, mode, dpi):
     body_font_root = _family(doc.body_font)
     runs, template, idx = [], [], 0
 
+    # ── 分数里的文字词（「côté adjacent / hypothénuse」这类文字分数）：
+    #    正体词紧贴在一条短分数线（细横线）的上/下。留在文字流的话，分子/
+    #    分母词按 x 序交错（「côtéhypothénuse adjacent」词序全乱），分数线
+    #    （纯图形）也会整条丢失。判定命中 ⇒ 按数学 span 处理，随公式一起
+    #    高清裁图。 ──
+    rules = None
+    frac_ids = set()
+    for _, ss in line_group:
+        for sp in ss:
+            if not re.search(r'[A-Za-zÀ-ÿ]', sp['text']):
+                continue
+            sb = sp['bbox']
+            w = sb[2] - sb[0]
+            if rules is None:
+                rules = _page_rules(page)
+            for rx0, ry0, rx1, ry1 in rules:
+                if ry1 - ry0 > 2.6 or rx1 - rx0 > 3.0 * max(w, 8.0):
+                    continue                  # 不是紧贴文字宽度的短横线
+                if min(sb[2], rx1) - max(sb[0], rx0) < 0.7 * w:
+                    continue                  # 横线没有基本覆盖这个词
+                just_below = -1.5 <= (ry0 - sb[3]) <= 4.0   # 线在词下方（分子）
+                just_above = -1.5 <= (sb[1] - ry1) <= 4.0   # 线在词上方（分母）
+                if just_below or just_above:
+                    frac_ids.add(id(sp))
+                    break
+
     def add_text(txt, bold=False, italic=False):
         nonlocal template
         if not txt:
@@ -697,7 +738,8 @@ def _build_para(line_group, doc, page, mode, dpi):
         for sp in spans:
             fam = _family(sp['font'])
             ism = bool(any(_is_math_char(c) for c in sp['text']) or
-                       (_MATH_FAMILY.match(fam) and fam != body_font_root))
+                       (_MATH_FAMILY.match(fam) and fam != body_font_root) or
+                       id(sp) in frac_ids)
             if ism:
                 joins = True
             else:
@@ -1038,6 +1080,25 @@ def extract(path: str, mode: str = 'faithful', dpi: int = 300, progress=None) ->
                     # 纯行必须基本「被包含」在目标行的数学区里（cases 行、分数
                     # 子行）；超出太多的说明是独立居中大公式，不能并入（定义 3.1）
                     if xov <= 0.8 * (bb[2] - bb[0]):
+                        continue
+                    # 纯行不得与目标行的**正文文字**横向交叠：并入后 spans 按 x 序
+                    # 重排，若文字注在纯行 x 范围之内，文字与公式碎片必然互相穿插
+                    # （例 3.4：注释「d'après les formules d'Euler」与上一行公式
+                    # 尾部交错，整段推导被搅成乱码）。分数子行在公式正下方、与
+                    # 文字无横向交集，不受影响。
+                    _bad = False
+                    for _sp in lines[t][1]:
+                        _fm = _family(_sp['font'])
+                        if any(_is_math_char(c) for c in _sp['text']) or \
+                           (_MATH_FAMILY.match(_fm) and _fm != body_root):
+                            continue
+                        _sj = _sp['text'].strip()
+                        if not _sj or not re.search(r'[A-Za-zÀ-ÿ]', _sj):
+                            continue
+                        if min(bb[2], _sp['bbox'][2]) - max(bb[0], _sp['bbox'][0]) > 3:
+                            _bad = True
+                            break
+                    if _bad:
                         continue
                     if kinds[t][2]:
                         if ygap > 12:                # 符号行：允许小间隙

@@ -13,7 +13,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-from pdftrans import extract as X, translate as T, build as B
+from pdftrans import extract as X, translate as T, build as B, scan as SC
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 HOME = os.environ.get('PDFTOOL_HOME', os.path.expanduser('~/.pdftool'))
@@ -141,6 +141,98 @@ def make_translator(cfg, log):
     return None
 
 
+def tr_vision_ok(cfg: dict) -> bool:
+    """只有内置免密钥通道（支持 GET 页面图 → 视觉模型）才能跑视觉链路。"""
+    return cfg.get('engine', 'builtin') == 'builtin' and bool(BUILTIN_ENABLED)
+
+
+def run_vision_pipeline(job: dict, pdf_path: str, cfg: dict, log, prog, ratio):
+    """扫描件链路：整页图 → 视觉模型 → Markdown(+LaTeX) → Word / PDF / HTML。
+
+    原版式保留依赖可提取的文字层与矢量，扫描件两者都没有；此时把公式交给
+    视觉模型识读（保住 re^{iφ}、∀θ∈]0,π/2] 这类结构），再用 MathJax 排出来。
+    """
+    import httpx
+    from pdftrans import mdrender as MD
+    model = cfg.get('vision_model') or 'glm-5v-turbo'
+    log('识别为影印/扫描件（无文字层页面占比 %.0f%%），改用视觉模型整页翻译'
+        % (ratio * 100))
+    tr = T.CloudTranslator(endpoint=BUILTIN['endpoint'],
+                           publishable_key=BUILTIN['publishable_key'],
+                           model=model,
+                           request_timeout=int(cfg.get('timeout', 100) or 100))
+
+    async def _go():
+        limits = httpx.Limits(max_connections=8, max_keepalive_connections=8)
+        async with httpx.AsyncClient(
+                limits=limits, follow_redirects=True,
+                timeout=max(120, int(cfg.get('timeout', 100) or 100))) as client:
+            return await SC.translate_pages(
+                pdf_path, tr, client,
+                src=cfg.get('src', '法语'), tgt=cfg.get('tgt', '简体中文'),
+                dpi=int(cfg.get('scan_dpi', 170) or 170),
+                model=model, log=log, prog=prog,
+                concurrency=int(cfg.get('concurrency', 4) or 4))
+
+    pages = asyncio.run(_go())
+    n_ok = sum(1 for _, md in pages if md)
+    if not n_ok:
+        raise RuntimeError('视觉翻译未产出任何内容（可能是空白文档或模型不可用）')
+    log('视觉翻译完成：%d / %d 页' % (n_ok, len(pages)))
+
+    fmts = cfg.get('formats') or ['docx']
+    base = os.path.join(job['dir'], os.path.splitext(os.path.basename(pdf_path))[0])
+    job['files'] = []
+    note = ('本文档为影印/扫描件，原 PDF 没有可提取的文字层与矢量版式，'
+            '由视觉模型按页识读后重排译文；公式以 LaTeX 还原。')
+    md_pages = [('第 %d 页' % (i + 1), md) for i, md in pages if md]
+    hp = None
+    if 'html' in fmts or 'pdf' in fmts:
+        hp = base + '.译本.html'
+        MD.render_html_pages(md_pages, hp,
+                             title=os.path.splitext(os.path.basename(pdf_path))[0],
+                             note=note)
+    if 'docx' in fmts:
+        p = base + '.译本.docx'
+        MD.render_docx_pages(md_pages, p)
+        job['files'].append({'name': os.path.basename(p), 'size': os.path.getsize(p)})
+    if 'pdf' in fmts:
+        p = base + '.译本.pdf'
+        log('正在用浏览器打印 PDF…')
+        try:
+            _print_pdf(hp, p)
+            job['files'].append({'name': os.path.basename(p),
+                                 'size': os.path.getsize(p)})
+        except Exception as e:
+            log('PDF 生成失败：%s' % str(e)[:100])
+    if 'html' in fmts and hp:
+        job['files'].append({'name': os.path.basename(hp),
+                             'size': os.path.getsize(hp)})
+    job['done'] = True
+    job['progress'] = 100
+    job['message'] = '完成（视觉翻译 %d 页）' % n_ok
+    log(job['message'])
+    return job
+
+
+def _print_pdf(html_path: str, out: str, timeout=180):
+    import subprocess
+    browser = B.find_browser()
+    if not browser:
+        raise RuntimeError('未找到 Chrome/Edge 浏览器，无法生成 PDF')
+    cmd = [browser, '--headless=new', '--disable-gpu', '--no-sandbox',
+           '--no-pdf-header-footer', '--run-all-compositor-stages-before-draw',
+           '--virtual-time-budget=20000',
+           '--print-to-pdf=' + os.path.abspath(out),
+           'file://' + os.path.abspath(html_path)]
+    env = dict(os.environ)
+    for k in ('HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy'):
+        env.pop(k, None)
+    subprocess.run(cmd, capture_output=True, timeout=timeout, env=env)
+    if not os.path.exists(out):
+        raise RuntimeError('浏览器打印未产出文件')
+
+
 def run_pipeline(job: dict, pdf_path: str, cfg: dict):
     t0 = time.time()
     logs = job['logs']
@@ -152,13 +244,21 @@ def run_pipeline(job: dict, pdf_path: str, cfg: dict):
         job['progress'] = round(min(0.99, f) * 100)
         job['message'] = m
 
+    import pymupdf as _fz0
+    _np = len(_fz0.open(pdf_path))
+    _ratio = SC.scan_ratio(pdf_path) if _np else 0.0
+    _force = cfg.get('scan_mode') == 'vision'
+    if _np > MAX_PAGES:
+        raise RuntimeError('文档 %d 页，超过公共服务的 %d 页上限，请拆分后上传'
+                           % (_np, MAX_PAGES))
+    # ── 扫描件（无文字层）走视觉模型整页翻译；有文字层的照旧原版式还原 ──
+    if tr_vision_ok(cfg) and (_force or _ratio >= 0.6):
+        return run_vision_pipeline(job, pdf_path, cfg, log, prog, _ratio)
+
     try:
         prog(0.01, '正在抽取版式…')
         doc = X.extract(pdf_path, mode=cfg.get('mode', 'faithful'),
                         dpi=int(cfg.get('dpi', 300) or 300), progress=prog)
-        if doc.pages > MAX_PAGES:
-            raise RuntimeError('文档 %d 页，超过公共服务的 %d 页上限，请拆分后上传'
-                               % (doc.pages, MAX_PAGES))
         log('抽取完成：%d 页，%d 个内容块' % (doc.pages, len(doc.blocks)))
 
         body_units = T.collect_templates(doc.blocks)
